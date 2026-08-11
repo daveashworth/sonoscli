@@ -10,6 +10,7 @@ import (
 )
 
 func TestDiscoverDefaultExcludesInvisible(t *testing.T) {
+	t.Setenv("SONOSCLI_COMPLETION_CACHE_DIR", t.TempDir())
 	flags := &rootFlags{Timeout: 123 * time.Millisecond, Format: formatPlain}
 	cmd := newDiscoverCmd(flags)
 
@@ -41,9 +42,13 @@ func TestDiscoverDefaultExcludesInvisible(t *testing.T) {
 	if !strings.Contains(out.String(), "Office\t192.168.1.20\tRINCON_OFF1400") {
 		t.Fatalf("unexpected output: %q", out.String())
 	}
+	if ip, ok := cachedTopologyFootholdIP(time.Now(), "Office"); !ok || ip != "192.168.1.20" {
+		t.Fatalf("cached discovery foothold = %q, %v", ip, ok)
+	}
 }
 
 func TestDiscoverAllIncludesInvisible(t *testing.T) {
+	t.Setenv("SONOSCLI_COMPLETION_CACHE_DIR", t.TempDir())
 	flags := &rootFlags{Timeout: 5 * time.Second, Format: formatPlain}
 	cmd := newDiscoverCmd(flags)
 	cmd.SetArgs([]string{"--all"})
@@ -69,9 +74,13 @@ func TestDiscoverAllIncludesInvisible(t *testing.T) {
 	if !got.IncludeInvisible {
 		t.Fatalf("expected IncludeInvisible=true with --all")
 	}
+	if _, ok := cachedTopologyFootholdIP(time.Now(), "Office"); ok {
+		t.Fatal("discover --all should not populate the normal room cache")
+	}
 }
 
 func TestDiscoverJSONOutput(t *testing.T) {
+	t.Setenv("SONOSCLI_COMPLETION_CACHE_DIR", t.TempDir())
 	flags := &rootFlags{Timeout: 5 * time.Second, Format: formatJSON}
 	cmd := newDiscoverCmd(flags)
 

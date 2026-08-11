@@ -37,6 +37,6 @@ sonos discover --format json | jq -r '.[].name'
 3. If SSDP returns nothing, scan the local subnet for TCP `1400` and try step 2 against any responder.
 4. Filter out invisible/bonded devices unless `--all` is set.
 
-The topology result is cached briefly so subsequent commands don't re-discover.
+Visible room addresses are cached briefly so subsequent `--name` commands can skip SSDP. Each command still fetches fresh topology before acting, so group changes are respected. An expired or unreachable cache entry falls back to normal discovery.
 
 See [Discovery](../discovery.md) for the full story.

@@ -36,7 +36,7 @@ On:   http://<ip>:1400/ZoneGroupTopology/Control
 
 The response is an XML document with the canonical view of the system: every zone, its coordinator, group members, and bonded satellites. This matches what the Sonos app shows.
 
-`sonoscli` parses this into Go structs once per command and caches it briefly so the next command doesn't re-discover.
+`sonoscli` parses this into Go structs once per command. It caches room addresses as discovery footholds, but always fetches fresh topology before acting.
 
 ## 3. Subnet scan (last resort)
 
@@ -55,12 +55,14 @@ Topology gives the same answer the Sonos app gives. By default `sonoscli` shows 
 
 ## Caching
 
-Discovered speaker names are cached locally so:
+Discovered visible-room names and addresses are cached locally so:
 
-- Subsequent commands skip discovery when the cache is fresh.
+- Subsequent `--name` commands can skip SSDP when the cache is fresh.
+- Every command still fetches current topology, so regrouping is respected.
+- Expired or unreachable entries automatically fall back to full discovery.
 - Shell completion for `--name` works without network calls.
 
-The cache lives next to the config file. If anything looks stale, just run `sonos discover` again — it overwrites the cache.
+The cache lives in your platform's user cache directory. Running `sonos discover` refreshes it.
 
 ## Tips for flaky networks
 

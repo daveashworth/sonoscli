@@ -3,16 +3,30 @@ package cli
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
+
+	"github.com/steipete/sonoscli/internal/sonos"
 )
 
-const nameCompletionCacheTTL = 30 * time.Second
+const (
+	nameCompletionCacheTTL    = 30 * time.Second
+	discoveryFootholdCacheTTL = 5 * time.Minute
+)
+
+type cachedSpeaker struct {
+	Name string `json:"name"`
+	IP   string `json:"ip"`
+}
 
 type nameCompletionCacheFile struct {
-	UpdatedAt time.Time `json:"updatedAt"`
-	Names     []string  `json:"names"`
+	UpdatedAt time.Time       `json:"updatedAt"`
+	Names     []string        `json:"names"`
+	Speakers  []cachedSpeaker `json:"speakers,omitempty"`
 }
 
 func readNameCompletionCacheFile() (nameCompletionCacheFile, bool) {
@@ -52,10 +66,83 @@ func cachedNameCompletions(now time.Time) ([]string, bool) {
 	return cache.Names, true
 }
 
+func cachedTopologyFootholdIP(now time.Time, preferredName string) (string, bool) {
+	cache, ok := readNameCompletionCacheFile()
+	if !ok || now.Sub(cache.UpdatedAt) > discoveryFootholdCacheTTL {
+		return "", false
+	}
+
+	preferredName = strings.TrimSpace(preferredName)
+	fallbackIP := ""
+	for _, speaker := range cache.Speakers {
+		name := strings.TrimSpace(speaker.Name)
+		ip := strings.TrimSpace(speaker.IP)
+		if name == "" || net.ParseIP(ip) == nil {
+			continue
+		}
+		if fallbackIP == "" {
+			fallbackIP = ip
+		}
+		if name == preferredName {
+			return ip, true
+		}
+	}
+	for _, speaker := range cache.Speakers {
+		name := strings.TrimSpace(speaker.Name)
+		ip := strings.TrimSpace(speaker.IP)
+		if name != "" && net.ParseIP(ip) != nil && strings.EqualFold(name, preferredName) {
+			return ip, true
+		}
+	}
+	return fallbackIP, fallbackIP != ""
+}
+
 func storeNameCompletions(now time.Time, names []string) error {
 	if len(names) == 0 {
 		return errors.New("no names")
 	}
+	return writeNameCompletionCache(nameCompletionCacheFile{
+		UpdatedAt: now,
+		Names:     names,
+	})
+}
+
+func storeDiscoveredDevices(now time.Time, devices []sonos.Device) error {
+	names := extractDeviceNames(devices)
+	if len(names) == 0 {
+		return errors.New("no names")
+	}
+
+	speakers := make([]cachedSpeaker, 0, len(devices))
+	seen := make(map[string]struct{}, len(devices))
+	for _, device := range devices {
+		name := strings.TrimSpace(device.Name)
+		ip := strings.TrimSpace(device.IP)
+		if name == "" || net.ParseIP(ip) == nil {
+			continue
+		}
+		key := strings.ToLower(name) + "\x00" + ip
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		speakers = append(speakers, cachedSpeaker{Name: name, IP: ip})
+	}
+	sort.Slice(speakers, func(i, j int) bool {
+		if speakers[i].Name == speakers[j].Name {
+			return speakers[i].IP < speakers[j].IP
+		}
+		return speakers[i].Name < speakers[j].Name
+	})
+
+	return writeNameCompletionCache(nameCompletionCacheFile{
+		UpdatedAt: now,
+		Names:     names,
+		Speakers:  speakers,
+	})
+}
+
+func writeNameCompletionCache(cache nameCompletionCacheFile) error {
 	path, err := nameCompletionCachePath()
 	if err != nil {
 		return err
@@ -66,10 +153,6 @@ func storeNameCompletions(now time.Time, names []string) error {
 		return err
 	}
 
-	cache := nameCompletionCacheFile{
-		UpdatedAt: now,
-		Names:     names,
-	}
 	raw, err := json.Marshal(cache)
 	if err != nil {
 		return err

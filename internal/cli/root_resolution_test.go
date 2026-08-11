@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -25,6 +26,17 @@ func httpResponse(status int, body string) *http.Response {
 		Header:     make(http.Header),
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
+}
+
+func topologyResponse(zgs string) *http.Response {
+	return httpResponse(http.StatusOK, `<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:GetZoneGroupStateResponse xmlns:u="urn:schemas-upnp-org:service:ZoneGroupTopology:1">
+      <ZoneGroupState><![CDATA[`+zgs+`]]></ZoneGroupState>
+    </u:GetZoneGroupStateResponse>
+  </s:Body>
+</s:Envelope>`)
 }
 
 func TestExecute_Version(t *testing.T) {
@@ -60,6 +72,7 @@ func TestExecute_Version(t *testing.T) {
 }
 
 func TestResolveTargetCoordinatorIP_IPAndName(t *testing.T) {
+	t.Setenv("SONOSCLI_COMPLETION_CACHE_DIR", t.TempDir())
 	oldNew := newSonosClient
 	oldDiscover := sonosDiscover
 	t.Cleanup(func() {
@@ -76,14 +89,7 @@ func TestResolveTargetCoordinatorIP_IPAndName(t *testing.T) {
 		if !strings.Contains(r.Header.Get("SOAPACTION"), "ZoneGroupTopology:1#GetZoneGroupState") {
 			return httpResponse(500, ""), nil
 		}
-		return httpResponse(200, `<?xml version="1.0"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
-  <s:Body>
-    <u:GetZoneGroupStateResponse xmlns:u="urn:schemas-upnp-org:service:ZoneGroupTopology:1">
-      <ZoneGroupState><![CDATA[`+zgs+`]]></ZoneGroupState>
-    </u:GetZoneGroupStateResponse>
-  </s:Body>
-</s:Envelope>`), nil
+		return topologyResponse(zgs), nil
 	})
 
 	newSonosClient = func(ip string, timeout time.Duration) *sonos.Client {
@@ -123,5 +129,107 @@ func TestResolveTargetCoordinatorIP_IPAndName(t *testing.T) {
 	}
 	if c.IP != "10.0.0.1" {
 		t.Fatalf("unexpected client ip: %q", c.IP)
+	}
+}
+
+func TestResolveTargetCoordinatorIP_UsesCachedFootholdAndFreshTopology(t *testing.T) {
+	t.Setenv("SONOSCLI_COMPLETION_CACHE_DIR", t.TempDir())
+	if err := storeDiscoveredDevices(time.Now(), []sonos.Device{{Name: "Office", IP: "10.0.0.2"}}); err != nil {
+		t.Fatalf("store discovered devices: %v", err)
+	}
+
+	oldNew := newSonosClient
+	oldDiscover := sonosDiscover
+	t.Cleanup(func() {
+		newSonosClient = oldNew
+		sonosDiscover = oldDiscover
+	})
+
+	zgs := `<ZoneGroupState><ZoneGroups><ZoneGroup Coordinator="RINCON_NEW1400" ID="RINCON_NEW1400:1">` +
+		`<ZoneGroupMember ZoneName="New Coordinator" UUID="RINCON_NEW1400" Location="http://10.0.0.9:1400/xml/device_description.xml" Invisible="0" />` +
+		`<ZoneGroupMember ZoneName="Office" UUID="RINCON_OFFICE1400" Location="http://10.0.0.2:1400/xml/device_description.xml" Invisible="0" />` +
+		`</ZoneGroup></ZoneGroups></ZoneGroupState>`
+
+	var clientIP string
+	var clientTimeout time.Duration
+	newSonosClient = func(ip string, timeout time.Duration) *sonos.Client {
+		clientIP = ip
+		clientTimeout = timeout
+		return &sonos.Client{
+			IP:   ip,
+			Port: 1400,
+			HTTP: &http.Client{Timeout: timeout, Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return topologyResponse(zgs), nil
+			})},
+		}
+	}
+	sonosDiscover = func(context.Context, sonos.DiscoverOptions) ([]sonos.Device, error) {
+		t.Fatal("cache hit should skip discovery")
+		return nil, nil
+	}
+
+	ip, err := resolveTargetCoordinatorIP(context.Background(), &rootFlags{Name: "office", Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("resolve cached coordinator: %v", err)
+	}
+	if ip != "10.0.0.9" {
+		t.Fatalf("coordinator = %q, want current topology coordinator", ip)
+	}
+	if clientIP != "10.0.0.2" {
+		t.Fatalf("topology foothold = %q, want cached room IP", clientIP)
+	}
+	if clientTimeout != cachedTopologyProbeTimeout {
+		t.Fatalf("cache probe timeout = %s, want %s", clientTimeout, cachedTopologyProbeTimeout)
+	}
+}
+
+func TestResolveTargetCoordinatorIP_DeadCachedFootholdFallsBackAndRefreshes(t *testing.T) {
+	t.Setenv("SONOSCLI_COMPLETION_CACHE_DIR", t.TempDir())
+	if err := storeDiscoveredDevices(time.Now(), []sonos.Device{{Name: "Office", IP: "10.0.0.99"}}); err != nil {
+		t.Fatalf("store discovered devices: %v", err)
+	}
+
+	oldNew := newSonosClient
+	oldDiscover := sonosDiscover
+	t.Cleanup(func() {
+		newSonosClient = oldNew
+		sonosDiscover = oldDiscover
+	})
+
+	zgs := `<ZoneGroupState><ZoneGroups><ZoneGroup Coordinator="RINCON_OFFICE1400" ID="RINCON_OFFICE1400:1">` +
+		`<ZoneGroupMember ZoneName="Office" UUID="RINCON_OFFICE1400" Location="http://10.0.0.2:1400/xml/device_description.xml" Invisible="0" />` +
+		`</ZoneGroup></ZoneGroups></ZoneGroupState>`
+
+	var cachedProbeTimeout time.Duration
+	newSonosClient = func(ip string, timeout time.Duration) *sonos.Client {
+		transport := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			if ip == "10.0.0.99" {
+				return nil, errors.New("speaker offline")
+			}
+			return topologyResponse(zgs), nil
+		})
+		if ip == "10.0.0.99" {
+			cachedProbeTimeout = timeout
+		}
+		return &sonos.Client{IP: ip, Port: 1400, HTTP: &http.Client{Timeout: timeout, Transport: transport}}
+	}
+	discoveryCalls := 0
+	sonosDiscover = func(context.Context, sonos.DiscoverOptions) ([]sonos.Device, error) {
+		discoveryCalls++
+		return []sonos.Device{{Name: "Office", IP: "10.0.0.2"}}, nil
+	}
+
+	ip, err := resolveTargetCoordinatorIP(context.Background(), &rootFlags{Name: "Office", Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("resolve after cache failure: %v", err)
+	}
+	if ip != "10.0.0.2" || discoveryCalls != 1 {
+		t.Fatalf("fallback result = %q with %d discovery calls", ip, discoveryCalls)
+	}
+	if cachedProbeTimeout != cachedTopologyProbeTimeout {
+		t.Fatalf("dead cache probe timeout = %s, want %s", cachedProbeTimeout, cachedTopologyProbeTimeout)
+	}
+	if cachedIP, ok := cachedTopologyFootholdIP(time.Now(), "Office"); !ok || cachedIP != "10.0.0.2" {
+		t.Fatalf("refreshed cache = %q, %v", cachedIP, ok)
 	}
 }

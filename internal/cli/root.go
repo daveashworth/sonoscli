@@ -40,6 +40,8 @@ var (
 	sonosDiscover  = sonos.Discover
 )
 
+const cachedTopologyProbeTimeout = time.Second
+
 var loadAppConfig = func() (appconfig.Config, error) {
 	s, err := appconfig.NewDefaultStore()
 	if err != nil {
@@ -148,7 +150,7 @@ func nameFlagCompletion(flags *rootFlags) func(*cobra.Command, []string, string)
 			devs, err := sonosDiscover(ctx, sonos.DiscoverOptions{Timeout: timeout})
 			if err == nil && len(devs) > 0 {
 				names = extractDeviceNames(devs)
-				_ = storeNameCompletions(now, names)
+				_ = storeDiscoveredDevices(now, devs)
 			} else {
 				// Best-effort fallback: if discovery fails, return stale cache rather than nothing.
 				if cache, ok := readNameCompletionCacheFile(); ok {
@@ -241,7 +243,28 @@ func resolveTargetCoordinatorIP(ctx context.Context, flags *rootFlags) (string, 
 		return flags.IP, nil
 	}
 
-	// Name-based selection: discover a speaker, then use topology.
+	// A cached room IP is only a foothold: fetch current topology so group
+	// coordinator changes are always respected.
+	if cachedIP, ok := cachedTopologyFootholdIP(time.Now(), flags.Name); ok {
+		probeTimeout := cachedTopologyProbeTimeout
+		if flags.Timeout > 0 && flags.Timeout < probeTimeout {
+			probeTimeout = flags.Timeout
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		c := newSonosClient(cachedIP, probeTimeout)
+		top, cacheErr := c.GetTopology(probeCtx)
+		cancel()
+		if cacheErr == nil {
+			if coordIP, ok := top.CoordinatorIPForName(flags.Name); ok {
+				return coordIP, nil
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+	}
+
+	// Cache miss or failed validation: discover a speaker, then use topology.
 	devs, err := sonosDiscover(ctx, sonos.DiscoverOptions{Timeout: flags.Timeout})
 	if err != nil {
 		return "", err
@@ -259,6 +282,7 @@ func resolveTargetCoordinatorIP(ctx context.Context, flags *rootFlags) (string, 
 	if !ok {
 		return "", errors.New("speaker name not found in topology: " + flags.Name)
 	}
+	_ = storeDiscoveredDevices(time.Now(), devs)
 	return coordIP, nil
 }
 

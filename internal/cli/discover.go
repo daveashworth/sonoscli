@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steipete/sonoscli/internal/sonos"
@@ -44,6 +45,9 @@ func newDiscoverCmd(flags *rootFlags) *cobra.Command {
 					return writeJSON(cmd, devices)
 				}
 				return errors.New("no speakers found (try increasing --timeout)")
+			}
+			if !all {
+				_ = storeDiscoveredDevices(time.Now(), devices)
 			}
 
 			if isJSON(flags) {

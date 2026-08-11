@@ -26,7 +26,7 @@ Every command follows the same path:
 1. **Parse flags** with Cobra. Global flags: `--name`, `--ip`, `--format`, `--debug`, `--timeout`.
 2. **Resolve target** — when a command needs a speaker:
    - `--ip` is used directly.
-   - Otherwise `--name` is matched against the cached topology (and discovery is run if the cache is empty).
+   - Otherwise a cached room address is used to fetch fresh topology. Discovery runs when the cache is empty, expired, or unreachable.
 3. **Resolve coordinator** — transport-affecting commands (`play`, `pause`, `next`, queue, etc.) walk the topology and replace the target with its group coordinator. This is why a `pause` aimed at a satellite still pauses the whole group.
 4. **Issue SOAP** — a tiny SOAP client posts to `http://<coordinator-ip>:1400/MediaRenderer/AVTransport/Control` (or whichever service is needed) with the right `SOAPAction` header.
 5. **Format output** — `--format plain|json|tsv` runs through one rendering layer so every command prints consistently.
