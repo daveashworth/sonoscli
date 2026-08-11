@@ -2,12 +2,15 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -230,5 +233,223 @@ func TestWatchCmd_PlainParseError(t *testing.T) {
 	got := out.String()
 	if !strings.Contains(got, "[avtransport]") || !strings.Contains(got, "parse_error=") {
 		t.Fatalf("unexpected output: %q", got)
+	}
+}
+
+type watchRenewResult struct {
+	sub sonos.Subscription
+	err error
+}
+
+type scriptedWatchRenewer struct {
+	mu          sync.Mutex
+	results     []watchRenewResult
+	fallbackErr error
+	calls       []sonos.Subscription
+}
+
+func (r *scriptedWatchRenewer) Renew(_ context.Context, sub sonos.Subscription, _ time.Duration) (sonos.Subscription, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, sub)
+	if len(r.results) == 0 {
+		return sonos.Subscription{}, r.fallbackErr
+	}
+	result := r.results[0]
+	r.results = r.results[1:]
+	return result.sub, result.err
+}
+
+func (r *scriptedWatchRenewer) calledWithTimeouts() []time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	timeouts := make([]time.Duration, len(r.calls))
+	for i, call := range r.calls {
+		timeouts[i] = call.Timeout
+	}
+	return timeouts
+}
+
+func TestRenewWatchSubscriptionRetriesAndUsesUpdatedLease(t *testing.T) {
+	transientErr := errors.New("temporary network failure")
+	renewer := &scriptedWatchRenewer{results: []watchRenewResult{
+		{err: transientErr},
+		{sub: sonos.Subscription{SID: "uuid:avt", Timeout: 20 * time.Millisecond}},
+		{sub: sonos.Subscription{SID: "uuid:avt", Infinite: true}},
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := renewWatchSubscription(ctx, renewer, "avtransport", sonos.Subscription{SID: "uuid:avt", Timeout: 10 * time.Millisecond}); err != nil {
+		t.Fatalf("renewWatchSubscription: %v", err)
+	}
+
+	want := []time.Duration{10 * time.Millisecond, 10 * time.Millisecond, 20 * time.Millisecond}
+	got := renewer.calledWithTimeouts()
+	if len(got) != len(want) {
+		t.Fatalf("renew calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("renew call timeouts = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestRenewWatchSubscriptionReportsFailureBeforeExpiry(t *testing.T) {
+	renewErr := errors.New("speaker unavailable")
+	renewer := &scriptedWatchRenewer{fallbackErr: renewErr}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := renewWatchSubscription(ctx, renewer, "renderingcontrol", sonos.Subscription{SID: "uuid:rc", Timeout: 100 * time.Millisecond})
+	if !errors.Is(err, renewErr) {
+		t.Fatalf("renewWatchSubscription error = %v, want wrapped %v", err, renewErr)
+	}
+	if !strings.Contains(err.Error(), "renderingcontrol") {
+		t.Fatalf("renewWatchSubscription error lacks service context: %v", err)
+	}
+	if calls := len(renewer.calledWithTimeouts()); calls < 2 {
+		t.Fatalf("renew calls = %d, want at least one retry", calls)
+	}
+}
+
+func TestRenewWatchSubscriptionSkipsInfiniteLease(t *testing.T) {
+	renewer := &scriptedWatchRenewer{fallbackErr: errors.New("unexpected renewal")}
+	if err := renewWatchSubscription(context.Background(), renewer, "avtransport", sonos.Subscription{Infinite: true}); err != nil {
+		t.Fatalf("renewWatchSubscription: %v", err)
+	}
+	if calls := len(renewer.calledWithTimeouts()); calls != 0 {
+		t.Fatalf("renew calls = %d, want 0", calls)
+	}
+}
+
+func TestWatchCmdRenewsBothSubscriptions(t *testing.T) {
+	var mu sync.Mutex
+	renewals := map[string]int{}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/ZoneGroupTopology/Control":
+			w.WriteHeader(http.StatusInternalServerError)
+		case r.Method == "SUBSCRIBE":
+			var sid string
+			switch r.URL.Path {
+			case "/MediaRenderer/AVTransport/Event":
+				sid = "uuid:avt"
+			case "/MediaRenderer/RenderingControl/Event":
+				sid = "uuid:rc"
+			default:
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if gotSID := r.Header.Get("SID"); gotSID != "" {
+				if gotSID != sid {
+					t.Errorf("renew SID = %q, want %q", gotSID, sid)
+				}
+				mu.Lock()
+				renewals[sid]++
+				mu.Unlock()
+				w.Header().Set("TIMEOUT", "infinite")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			w.Header().Set("SID", sid)
+			w.Header().Set("TIMEOUT", "Second-1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == "UNSUBSCRIBE":
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	u, _ := url.Parse(srv.URL)
+	port, _ := strconv.Atoi(u.Port())
+
+	oldNew := newSonosClient
+	t.Cleanup(func() { newSonosClient = oldNew })
+	newSonosClient = func(ip string, timeout time.Duration) *sonos.Client {
+		return &sonos.Client{IP: u.Hostname(), Port: port, HTTP: srv.Client()}
+	}
+
+	flags := &rootFlags{IP: u.Hostname(), Timeout: 2 * time.Second, Format: formatJSON}
+	cmd := newWatchCmd(flags)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SilenceErrors = true
+	cmd.SilenceUsage = true
+	cmd.SetArgs([]string{"--duration", "1100ms"})
+	if err := cmd.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if renewals["uuid:avt"] != 1 || renewals["uuid:rc"] != 1 {
+		t.Fatalf("renewals = %v, want one for each subscription", renewals)
+	}
+}
+
+type failingWatchListener struct {
+	err error
+}
+
+func (l *failingWatchListener) Accept() (net.Conn, error) { return nil, l.err }
+func (l *failingWatchListener) Close() error              { return nil }
+func (l *failingWatchListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345}
+}
+
+func TestWatchCmdReportsCallbackServerFailure(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/ZoneGroupTopology/Control":
+			w.WriteHeader(http.StatusInternalServerError)
+		case r.Method == "SUBSCRIBE":
+			if strings.Contains(r.URL.Path, "AVTransport") {
+				w.Header().Set("SID", "uuid:avt")
+			} else {
+				w.Header().Set("SID", "uuid:rc")
+			}
+			w.Header().Set("TIMEOUT", "infinite")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == "UNSUBSCRIBE":
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	u, _ := url.Parse(srv.URL)
+	port, _ := strconv.Atoi(u.Port())
+
+	oldNew := newSonosClient
+	t.Cleanup(func() { newSonosClient = oldNew })
+	newSonosClient = func(ip string, timeout time.Duration) *sonos.Client {
+		return &sonos.Client{IP: u.Hostname(), Port: port, HTTP: srv.Client()}
+	}
+
+	listenErr := errors.New("listener failed")
+	oldListen := watchListen
+	t.Cleanup(func() { watchListen = oldListen })
+	watchListen = func(string, string) (net.Listener, error) {
+		return &failingWatchListener{err: listenErr}, nil
+	}
+
+	flags := &rootFlags{IP: u.Hostname(), Timeout: 2 * time.Second, Format: formatJSON}
+	cmd := newWatchCmd(flags)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SilenceErrors = true
+	cmd.SilenceUsage = true
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := cmd.ExecuteContext(ctx)
+	if err == nil || !strings.Contains(err.Error(), "watch callback server") || !errors.Is(err, listenErr) {
+		t.Fatalf("watch error = %v, want wrapped callback server error", err)
 	}
 }

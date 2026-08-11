@@ -54,7 +54,7 @@ Only the actions actually needed by the CLI are wired up. Adding a new action is
 
 ## Eventing
 
-`sonos watch` uses UPnP eventing (GENA): it starts a small HTTP server, sends `SUBSCRIBE` requests for `AVTransport` and `RenderingControl`, and re-renders state changes as they stream in. The callback URL must be reachable from the speaker, which is why your firewall may prompt on first run.
+`sonos watch` uses UPnP eventing (GENA): it starts a small HTTP server, sends `SUBSCRIBE` requests for `AVTransport` and `RenderingControl`, renews finite subscription leases before they expire, and re-renders state changes as they stream in. The callback URL must be reachable from the speaker, which is why your firewall may prompt on first run.
 
 ## Stream proxy
 

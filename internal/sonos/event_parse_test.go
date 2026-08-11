@@ -1,27 +1,41 @@
 package sonos
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestParseSecondTimeout(t *testing.T) {
-	cases := []struct {
-		in   string
-		ok   bool
-		secs int
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		header       string
+		wantTimeout  time.Duration
+		wantInfinite bool
+		wantErr      bool
 	}{
-		{"Second-30", true, 30},
-		{"second-86400", true, 86400},
-		{"INFINITE", true, 0},
-		{"", false, 0},
-		{"Second-x", false, 0},
+		{name: "finite", header: "Second-1800", wantTimeout: 30 * time.Minute},
+		{name: "finite whitespace", header: "  second-60  ", wantTimeout: time.Minute},
+		{name: "infinite", header: " Infinite ", wantInfinite: true},
+		{name: "missing", wantErr: true},
+		{name: "zero", header: "Second-0", wantErr: true},
+		{name: "negative", header: "Second--1", wantErr: true},
+		{name: "malformed", header: "Second-nope", wantErr: true},
+		{name: "overflow", header: "Second-9223372037", wantErr: true},
 	}
-	for _, c := range cases {
-		d, ok := parseSecondTimeout(c.in)
-		if ok != c.ok {
-			t.Fatalf("parseSecondTimeout(%q) ok=%v want %v", c.in, ok, c.ok)
-		}
-		if ok && c.secs > 0 && int(d.Seconds()) != c.secs {
-			t.Fatalf("parseSecondTimeout(%q) secs=%d want %d", c.in, int(d.Seconds()), c.secs)
-		}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gotTimeout, gotInfinite, err := parseSecondTimeout(tt.header)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseSecondTimeout(%q) error = %v, wantErr %v", tt.header, err, tt.wantErr)
+			}
+			if gotTimeout != tt.wantTimeout || gotInfinite != tt.wantInfinite {
+				t.Fatalf("parseSecondTimeout(%q) = (%s, %v), want (%s, %v)", tt.header, gotTimeout, gotInfinite, tt.wantTimeout, tt.wantInfinite)
+			}
+		})
 	}
 }
 

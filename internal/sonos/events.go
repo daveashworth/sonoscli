@@ -10,25 +10,27 @@ import (
 )
 
 type Subscription struct {
-	SID     string
-	Timeout time.Duration
-	URL     string
+	SID      string
+	Timeout  time.Duration
+	Infinite bool
+	URL      string
 }
 
-func parseSecondTimeout(h string) (time.Duration, bool) {
+func parseSecondTimeout(h string) (time.Duration, bool, error) {
+	h = strings.TrimSpace(h)
 	if h == "" {
-		return 0, false
+		return 0, false, fmt.Errorf("missing TIMEOUT header")
 	}
 	if strings.EqualFold(h, "infinite") {
-		return 0, true
+		return 0, true, nil
 	}
-	h = strings.TrimSpace(h)
-	h = strings.TrimPrefix(strings.ToLower(h), "second-")
-	secs, err := strconv.Atoi(h)
-	if err != nil {
-		return 0, false
+	value := strings.TrimPrefix(strings.ToLower(h), "second-")
+	secs, err := strconv.ParseInt(value, 10, 64)
+	const maxDuration = time.Duration(1<<63 - 1)
+	if err != nil || secs <= 0 || secs > int64(maxDuration/time.Second) {
+		return 0, false, fmt.Errorf("invalid TIMEOUT header %q", h)
 	}
-	return time.Duration(secs) * time.Second, true
+	return time.Duration(secs) * time.Second, false, nil
 }
 
 func (c *Client) Subscribe(ctx context.Context, eventPath string, callbackURL string, requestedTimeout time.Duration) (Subscription, error) {
@@ -59,12 +61,16 @@ func (c *Client) Subscribe(ctx context.Context, eventPath string, callbackURL st
 		return Subscription{}, fmt.Errorf("subscribe response missing SID header")
 	}
 
-	to, _ := parseSecondTimeout(resp.Header.Get("TIMEOUT"))
+	to, infinite, err := parseSecondTimeout(resp.Header.Get("TIMEOUT"))
+	if err != nil {
+		return Subscription{}, fmt.Errorf("subscribe response: %w", err)
+	}
 
 	return Subscription{
-		SID:     sid,
-		Timeout: to,
-		URL:     c.baseURL() + eventPath,
+		SID:      sid,
+		Timeout:  to,
+		Infinite: infinite,
+		URL:      c.baseURL() + eventPath,
 	}, nil
 }
 
@@ -87,8 +93,12 @@ func (c *Client) Renew(ctx context.Context, sub Subscription, requestedTimeout t
 		return Subscription{}, fmt.Errorf("renew failed: %s", resp.Status)
 	}
 
-	to, _ := parseSecondTimeout(resp.Header.Get("TIMEOUT"))
+	to, infinite, err := parseSecondTimeout(resp.Header.Get("TIMEOUT"))
+	if err != nil {
+		return Subscription{}, fmt.Errorf("renew response: %w", err)
+	}
 	sub.Timeout = to
+	sub.Infinite = infinite
 	return sub, nil
 }
 

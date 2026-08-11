@@ -33,8 +33,9 @@ sonos watch --name "Kitchen" --format json | jq -r '.event'
 
 1. Spins up a local HTTP server (the *callback*).
 2. Sends `SUBSCRIBE` requests to `AVTransport/Event` and `RenderingControl/Event` on the speaker.
-3. Renders each `NOTIFY` body as a structured event line.
-4. On exit, sends `UNSUBSCRIBE` so the speaker stops calling back.
+3. Renews each finite subscription lease before it expires. If renewal cannot complete before expiry, exits with an error instead of silently serving stale output.
+4. Renders each `NOTIFY` body as a structured event line.
+5. On exit, sends `UNSUBSCRIBE` so the speaker stops calling back.
 
 ## Firewall
 

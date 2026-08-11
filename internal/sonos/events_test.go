@@ -14,7 +14,7 @@ func TestSubscribeRenewUnsubscribe(t *testing.T) {
 	t.Parallel()
 
 	mux := http.NewServeMux()
-	handle := func(expectedSID string) http.HandlerFunc {
+	handle := func(expectedSID string, initialTimeout string) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			switch r.Method {
 			case "SUBSCRIBE":
@@ -32,7 +32,7 @@ func TestSubscribeRenewUnsubscribe(t *testing.T) {
 					t.Fatalf("missing CALLBACK")
 				}
 				w.Header().Set("SID", expectedSID)
-				w.Header().Set("TIMEOUT", "Second-60")
+				w.Header().Set("TIMEOUT", initialTimeout)
 				w.WriteHeader(http.StatusOK)
 			case "UNSUBSCRIBE":
 				if r.Header.Get("SID") != expectedSID {
@@ -45,8 +45,8 @@ func TestSubscribeRenewUnsubscribe(t *testing.T) {
 		}
 	}
 
-	mux.HandleFunc(eventAVTransport, handle("uuid:sub-1"))
-	mux.HandleFunc(eventRenderingControl, handle("uuid:sub-rc"))
+	mux.HandleFunc(eventAVTransport, handle("uuid:sub-1", "Second-60"))
+	mux.HandleFunc(eventRenderingControl, handle("uuid:sub-rc", "infinite"))
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -63,7 +63,7 @@ func TestSubscribeRenewUnsubscribe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SubscribeAVTransport: %v", err)
 	}
-	if sub.SID != "uuid:sub-1" || sub.Timeout != 60*time.Second {
+	if sub.SID != "uuid:sub-1" || sub.Timeout != 60*time.Second || sub.Infinite {
 		t.Fatalf("unexpected subscription: %+v", sub)
 	}
 
@@ -71,7 +71,7 @@ func TestSubscribeRenewUnsubscribe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Renew: %v", err)
 	}
-	if sub2.Timeout != 120*time.Second {
+	if sub2.Timeout != 120*time.Second || sub2.Infinite {
 		t.Fatalf("renew timeout: %s", sub2.Timeout)
 	}
 
@@ -84,7 +84,7 @@ func TestSubscribeRenewUnsubscribe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SubscribeRenderingControl: %v", err)
 	}
-	if subRC.SID != "uuid:sub-rc" {
+	if subRC.SID != "uuid:sub-rc" || subRC.Timeout != 0 || !subRC.Infinite {
 		t.Fatalf("unexpected rc subscription: %+v", subRC)
 	}
 	if err := c.Unsubscribe(context.Background(), subRC); err != nil {

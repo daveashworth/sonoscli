@@ -26,6 +26,79 @@ type watchEvent struct {
 	Vars    map[string]string `json:"vars"`
 }
 
+const maxWatchRenewRetryDelay = 30 * time.Second
+
+type watchSubscriptionRenewer interface {
+	Renew(ctx context.Context, sub sonos.Subscription, requestedTimeout time.Duration) (sonos.Subscription, error)
+}
+
+var watchListen = net.Listen
+
+func waitForWatchRenewal(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func watchRenewDelay(timeout time.Duration) time.Duration {
+	return timeout - timeout/5
+}
+
+func watchRenewRetryDelay(timeout time.Duration) time.Duration {
+	delay := timeout / 20
+	if delay <= 0 {
+		delay = time.Nanosecond
+	}
+	if delay > maxWatchRenewRetryDelay {
+		return maxWatchRenewRetryDelay
+	}
+	return delay
+}
+
+func renewWatchSubscription(ctx context.Context, renewer watchSubscriptionRenewer, service string, sub sonos.Subscription) error {
+	for {
+		if sub.Infinite {
+			return nil
+		}
+		if sub.Timeout <= 0 {
+			return fmt.Errorf("%s subscription has no valid lease duration", service)
+		}
+
+		leaseDeadline := time.Now().Add(sub.Timeout)
+		if !waitForWatchRenewal(ctx, watchRenewDelay(sub.Timeout)) {
+			return ctx.Err()
+		}
+
+		for {
+			if !time.Now().Before(leaseDeadline) {
+				return fmt.Errorf("%s subscription lease expired before renewal", service)
+			}
+
+			renewed, err := renewer.Renew(ctx, sub, 0)
+			if err == nil {
+				sub = renewed
+				break
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			retryDelay := watchRenewRetryDelay(sub.Timeout)
+			if time.Until(leaseDeadline) <= retryDelay {
+				return fmt.Errorf("renew %s subscription before lease expiry: %w", service, err)
+			}
+			if !waitForWatchRenewal(ctx, retryDelay) {
+				return ctx.Err()
+			}
+		}
+	}
+}
+
 func listenIPForRemote(remoteIP string) (string, error) {
 	conn, err := net.Dial("udp", net.JoinHostPort(remoteIP, "1900"))
 	if err != nil {
@@ -70,7 +143,7 @@ func newWatchCmd(flags *rootFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ln, err := net.Listen("tcp", net.JoinHostPort(listenIP, "0"))
+			ln, err := watchListen("tcp", net.JoinHostPort(listenIP, "0"))
 			if err != nil {
 				return err
 			}
@@ -122,7 +195,12 @@ func newWatchCmd(flags *rootFlags) *cobra.Command {
 				Handler:           mux,
 				ReadHeaderTimeout: 5 * time.Second,
 			}
-			go func() { _ = srv.Serve(ln) }()
+			serverErrs := make(chan error, 1)
+			go func() {
+				if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					serverErrs <- fmt.Errorf("watch callback server: %w", err)
+				}
+			}()
 			defer func() { _ = srv.Shutdown(context.Background()) }()
 
 			avtSub, err := c.SubscribeAVTransport(ctx, callbackURL, 0)
@@ -139,6 +217,30 @@ func newWatchCmd(flags *rootFlags) *cobra.Command {
 			defer func() { _ = c.Unsubscribe(context.Background(), rcSub) }()
 			sidToService.Store(rcSub.SID, "renderingcontrol")
 
+			renewalCtx, cancelRenewals := context.WithCancel(ctx)
+			renewalErrs := make(chan error, 2)
+			var renewalWG sync.WaitGroup
+			startRenewal := func(service string, sub sonos.Subscription) {
+				renewalWG.Add(1)
+				go func() {
+					defer renewalWG.Done()
+					err := renewWatchSubscription(renewalCtx, c, service, sub)
+					if err == nil || renewalCtx.Err() != nil {
+						return
+					}
+					select {
+					case renewalErrs <- err:
+					case <-renewalCtx.Done():
+					}
+				}()
+			}
+			startRenewal("avtransport", avtSub)
+			startRenewal("renderingcontrol", rcSub)
+			defer func() {
+				cancelRenewals()
+				renewalWG.Wait()
+			}()
+
 			if !isJSON(flags) && !isTSV(flags) {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Watching events (callback %s). Press Ctrl+C to stop.\n", callbackURL)
 			}
@@ -147,6 +249,10 @@ func newWatchCmd(flags *rootFlags) *cobra.Command {
 				select {
 				case <-ctx.Done():
 					return nil
+				case err := <-serverErrs:
+					return err
+				case err := <-renewalErrs:
+					return err
 				case ev := <-events:
 					if isJSON(flags) {
 						_ = writeJSONLine(cmd, ev)
