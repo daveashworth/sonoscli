@@ -20,16 +20,15 @@ type DiscoverOptions struct {
 }
 
 var (
-	ssdpDiscoverFunc              = ssdpDiscover
-	scanAnySpeakerIPFunc          = scanAnySpeakerIP
-	discoverViaTopologyFunc       = discoverViaTopology
-	discoverViaTopologyFromIPFunc = discoverViaTopologyFromIP
-	fetchDeviceDescriptionFunc    = fetchDeviceDescription
-	newClientForDiscover          = NewClient
-	localIPv4AddrsFunc            = localIPv4Addrs
-	isPortOpenFunc                = isPortOpen
-	netInterfacesFunc             = net.Interfaces
-	ifaceAddrsFunc                = func(iface net.Interface) ([]net.Addr, error) { return iface.Addrs() }
+	ssdpDiscoverFunc           = ssdpDiscover
+	scanSpeakerIPsFunc         = scanSpeakerIPs
+	discoverViaTopologyFunc    = discoverViaTopology
+	fetchDeviceDescriptionFunc = fetchDeviceDescription
+	newClientForDiscover       = NewClient
+	localIPv4AddrsFunc         = localIPv4Addrs
+	isPortOpenFunc             = isPortOpen
+	netInterfacesFunc          = net.Interfaces
+	ifaceAddrsFunc             = func(iface net.Interface) ([]net.Addr, error) { return iface.Addrs() }
 )
 
 func Discover(ctx context.Context, opts DiscoverOptions) ([]Device, error) {
@@ -59,31 +58,37 @@ func Discover(ctx context.Context, opts DiscoverOptions) ([]Device, error) {
 	}
 	slog.Debug("discover: ssdp finished", "timeout", ssdpTimeout.String(), "results", len(ssdpResults), "err", errString(err))
 
-	// Prefer the topology-based approach (query one speaker for the full list),
-	// since not every speaker will reliably respond to SSDP M-SEARCH.
-	out, err := discoverViaTopologyFunc(opCtx, timeout, ssdpResults, opts.IncludeInvisible)
-	if err == nil && len(out) > 0 {
-		slog.Debug("discover: topology via ssdp candidates succeeded", "devices", len(out))
+	// SSDP can be incomplete or unavailable on some networks. Scan the local
+	// subnets as well so separate Sonos households (for example S1 and S2)
+	// are all represented in the topology candidates.
+	scanIPs, scanErr := scanSpeakerIPsFunc(opCtx, timeout)
+	if scanErr != nil {
+		slog.Debug("discover: subnet scan failed", "err", errString(scanErr))
+	} else {
+		slog.Debug("discover: subnet scan found speakers", "count", len(scanIPs))
+	}
+
+	candidates := append([]ssdpResult(nil), ssdpResults...)
+	for _, ip := range scanIPs {
+		candidates = append(candidates, ssdpResult{
+			Location: fmt.Sprintf("http://%s:1400/xml/device_description.xml", ip),
+		})
+	}
+
+	// Query every candidate and union the results. S1 and S2 systems expose
+	// separate topology snapshots even when they share a network.
+	out, topErr := discoverViaTopologyFunc(opCtx, timeout, candidates, opts.IncludeInvisible)
+	if topErr == nil && len(out) > 0 {
+		slog.Debug("discover: topology candidates succeeded", "devices", len(out))
 		return out, nil
 	}
-	slog.Debug("discover: topology via ssdp candidates failed", "err", errString(err))
+	slog.Debug("discover: topology candidates failed", "err", errString(topErr))
 
-	// SSDP sometimes fails or returns incomplete results on certain networks.
-	// Fall back to finding any reachable Sonos speaker, then query topology.
-	if anyIP, scanErr := scanAnySpeakerIPFunc(opCtx, timeout); scanErr == nil && anyIP != "" {
-		slog.Debug("discover: subnet scan found a speaker", "ip", anyIP)
-		out, topErr := discoverViaTopologyFromIPFunc(opCtx, timeout, anyIP, opts.IncludeInvisible)
-		if topErr == nil && len(out) > 0 {
-			slog.Debug("discover: topology via scanned speaker succeeded", "devices", len(out))
-			return out, nil
-		}
-		slog.Debug("discover: topology via scanned speaker failed", "ip", anyIP, "err", errString(topErr))
-	}
-
-	// Fallback: resolve each SSDP response directly.
+	// Last resort: resolve every candidate directly. This still returns useful
+	// devices when a legacy speaker does not provide a topology snapshot.
 	httpClient := defaultHTTPClient(timeout)
 	byIP := map[string]Device{}
-	for _, r := range ssdpResults {
+	for _, r := range candidates {
 		location := r.Location
 		if location == "" {
 			continue
@@ -145,6 +150,7 @@ func discoverViaTopologyFromIP(ctx context.Context, timeout time.Duration, ip st
 
 func discoverViaTopology(ctx context.Context, timeout time.Duration, results []ssdpResult, includeInvisible bool) ([]Device, error) {
 	candidates := make([]string, 0, len(results))
+	seenCandidates := map[string]struct{}{}
 	for _, r := range results {
 		if r.Location == "" {
 			continue
@@ -153,6 +159,10 @@ func discoverViaTopology(ctx context.Context, timeout time.Duration, results []s
 		if err != nil || ip == "" {
 			continue
 		}
+		if _, ok := seenCandidates[ip]; ok {
+			continue
+		}
+		seenCandidates[ip] = struct{}{}
 		candidates = append(candidates, ip)
 	}
 	if len(candidates) == 0 {
@@ -161,10 +171,11 @@ func discoverViaTopology(ctx context.Context, timeout time.Duration, results []s
 
 	slog.Debug("discover: querying topology candidates", "candidates", len(candidates))
 
-	// Query multiple candidates and keep the best (largest) result, to account
-	// for devices that may return incomplete topology snapshots.
+	// Query multiple candidates and merge their results. Different Sonos
+	// households return disjoint topology snapshots, including split S1/S2
+	// systems on the same network.
 	deadline := time.Now().Add(timeout)
-	bestByIP := map[string]Device{}
+	allByIP := map[string]Device{}
 	for _, ip := range candidates {
 		if time.Now().After(deadline) {
 			break
@@ -195,12 +206,16 @@ func discoverViaTopology(ctx context.Context, timeout time.Duration, results []s
 			}
 		}
 
-		bestByIP = preferDeviceSet(bestByIP, byIP)
+		for memberIP, device := range byIP {
+			if _, exists := allByIP[memberIP]; !exists {
+				allByIP[memberIP] = device
+			}
+		}
 	}
 
-	if len(bestByIP) > 0 {
-		slog.Debug("discover: topology candidates result", "devices", len(bestByIP))
-		return sortDevices(bestByIP), nil
+	if len(allByIP) > 0 {
+		slog.Debug("discover: topology candidates result", "devices", len(allByIP))
+		return sortDevices(allByIP), nil
 	}
 	return nil, errors.New("topology discovery failed")
 }
@@ -219,48 +234,21 @@ func sortDevices(byIP map[string]Device) []Device {
 	return out
 }
 
-func preferDeviceSet(best, candidate map[string]Device) map[string]Device {
-	if len(candidate) == 0 {
-		return best
-	}
-	if len(candidate) > len(best) {
-		return cloneDeviceMap(candidate)
-	}
-	if len(candidate) == len(best) {
-		out := cloneDeviceMap(best)
-		for k, v := range candidate {
-			if _, ok := out[k]; !ok {
-				out[k] = v
-			}
-		}
-		return out
-	}
-	return best
-}
-
-func cloneDeviceMap(in map[string]Device) map[string]Device {
-	out := make(map[string]Device, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-
-func scanAnySpeakerIP(ctx context.Context, timeout time.Duration) (string, error) {
+func scanSpeakerIPs(ctx context.Context, timeout time.Duration) ([]string, error) {
 	addrs, err := localIPv4AddrsFunc()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if len(addrs) == 0 {
-		return "", errors.New("no local IPv4 addresses found")
+		return nil, errors.New("no local IPv4 addresses found")
 	}
 	slog.Debug("discover: subnet scan start", "interfaces", len(addrs))
 
-	// Keep per-IP operations quick; we only need one match.
+	// Keep per-IP operations quick while collecting every validated speaker.
 	httpClient := defaultHTTPClient(2 * time.Second)
 
 	candidateIPs := make(chan string, 1024)
-	found := make(chan string, 1)
+	found := make(chan string)
 
 	workers := 128
 	var wg sync.WaitGroup
@@ -286,49 +274,74 @@ func scanAnySpeakerIP(ctx context.Context, timeout time.Duration) (string, error
 
 				select {
 				case found <- ip:
-				default:
+				case <-ctx.Done():
+					return
 				}
-				return
 			}
 		}()
 	}
 
-	seen := map[string]struct{}{}
-	for _, ip := range addrs {
-		prefix := ipTo24Prefix(ip)
-		if prefix == "" {
-			continue
-		}
-		if _, ok := seen[prefix]; ok {
-			continue
-		}
-		seen[prefix] = struct{}{}
+	go func() {
+		defer close(candidateIPs)
+		seen := map[string]struct{}{}
+		for _, ip := range addrs {
+			prefix := ipTo24Prefix(ip)
+			if prefix == "" {
+				continue
+			}
+			if _, ok := seen[prefix]; ok {
+				continue
+			}
+			seen[prefix] = struct{}{}
 
-		for host := 1; host <= 254; host++ {
-			select {
-			case candidateIPs <- fmt.Sprintf("%s.%d", prefix, host):
-			case ip := <-found:
-				close(candidateIPs)
-				wg.Wait()
-				return ip, nil
-			case <-ctx.Done():
-				close(candidateIPs)
-				wg.Wait()
-				return "", ctx.Err()
+			for host := 1; host <= 254; host++ {
+				select {
+				case candidateIPs <- fmt.Sprintf("%s.%d", prefix, host):
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
+	}()
+	go func() {
+		wg.Wait()
+		close(found)
+	}()
+
+	foundSet := map[string]struct{}{}
+	for ip := range found {
+		foundSet[ip] = struct{}{}
+	}
+	if len(foundSet) == 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("no sonos speakers found on local subnets")
 	}
 
-	close(candidateIPs)
-	wg.Wait()
-
-	select {
-	case ip := <-found:
-		slog.Debug("discover: subnet scan found speaker", "ip", ip)
-		return ip, nil
-	default:
-		return "", errors.New("no sonos speakers found on local subnets")
+	ips := make([]string, 0, len(foundSet))
+	for ip := range foundSet {
+		ips = append(ips, ip)
 	}
+	sort.Slice(ips, func(i, j int) bool {
+		return compareIPv4(ips[i], ips[j]) < 0
+	})
+	slog.Debug("discover: subnet scan found speakers", "count", len(ips))
+	return ips, nil
+}
+
+func compareIPv4(a, b string) int {
+	aIP := net.ParseIP(a).To4()
+	bIP := net.ParseIP(b).To4()
+	for i := 0; i < len(aIP) && i < len(bIP); i++ {
+		if aIP[i] < bIP[i] {
+			return -1
+		}
+		if aIP[i] > bIP[i] {
+			return 1
+		}
+	}
+	return strings.Compare(a, b)
 }
 
 func errString(err error) string {

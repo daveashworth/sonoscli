@@ -100,7 +100,10 @@ func TestResolveTargetCoordinatorIP_IPAndName(t *testing.T) {
 		}
 	}
 	sonosDiscover = func(ctx context.Context, opts sonos.DiscoverOptions) ([]sonos.Device, error) {
-		return []sonos.Device{{IP: "10.0.0.1", Name: "Living Room"}}, nil
+		return []sonos.Device{
+			{IP: "10.0.0.1", Name: "Living Room"},
+			{IP: "10.0.0.2", Name: "Office"},
+		}, nil
 	}
 
 	ctx := context.Background()
@@ -231,5 +234,49 @@ func TestResolveTargetCoordinatorIP_DeadCachedFootholdFallsBackAndRefreshes(t *t
 	}
 	if cachedIP, ok := cachedTopologyFootholdIP(time.Now(), "Office"); !ok || cachedIP != "10.0.0.2" {
 		t.Fatalf("refreshed cache = %q, %v", cachedIP, ok)
+	}
+}
+
+func TestResolveTargetCoordinatorIP_UsesMatchedHouseholdFoothold(t *testing.T) {
+	t.Setenv("SONOSCLI_COMPLETION_CACHE_DIR", t.TempDir())
+	oldNew := newSonosClient
+	oldDiscover := sonosDiscover
+	t.Cleanup(func() {
+		newSonosClient = oldNew
+		sonosDiscover = oldDiscover
+	})
+
+	sonosDiscover = func(context.Context, sonos.DiscoverOptions) ([]sonos.Device, error) {
+		return []sonos.Device{
+			{Name: "Bedroom", IP: "10.0.0.10"},
+			{Name: "Legacy Office", IP: "10.0.0.20"},
+		}, nil
+	}
+
+	legacyTopology := `<ZoneGroupState><ZoneGroups><ZoneGroup Coordinator="RINCON_LEGACY1400" ID="RINCON_LEGACY1400:1">` +
+		`<ZoneGroupMember ZoneName="Legacy Office" UUID="RINCON_LEGACY1400" Location="http://10.0.0.20:1400/xml/device_description.xml" Invisible="0" />` +
+		`</ZoneGroup></ZoneGroups></ZoneGroupState>`
+
+	var foothold string
+	newSonosClient = func(ip string, timeout time.Duration) *sonos.Client {
+		foothold = ip
+		return &sonos.Client{
+			IP:   ip,
+			Port: 1400,
+			HTTP: &http.Client{Timeout: timeout, Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return topologyResponse(legacyTopology), nil
+			})},
+		}
+	}
+
+	ip, err := resolveTargetCoordinatorIP(context.Background(), &rootFlags{Name: "Legacy Office", Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("resolve legacy household: %v", err)
+	}
+	if foothold != "10.0.0.20" {
+		t.Fatalf("topology foothold = %q, want matched S1 device", foothold)
+	}
+	if ip != "10.0.0.20" {
+		t.Fatalf("coordinator = %q, want legacy household coordinator", ip)
 	}
 }

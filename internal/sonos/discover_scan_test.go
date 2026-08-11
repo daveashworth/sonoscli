@@ -55,7 +55,7 @@ func TestLocalIPv4AddrsFiltersInterfacesAndAddresses(t *testing.T) {
 	}
 }
 
-func TestScanAnySpeakerIPFindsSpeaker(t *testing.T) {
+func TestScanSpeakerIPsFindsAllSpeakers(t *testing.T) {
 	origLocal := localIPv4AddrsFunc
 	origPort := isPortOpenFunc
 	origFetch := fetchDeviceDescriptionFunc
@@ -69,14 +69,19 @@ func TestScanAnySpeakerIPFindsSpeaker(t *testing.T) {
 		return []net.IP{net.IPv4(192, 168, 50, 10)}, nil
 	}
 
-	wantIP := "192.168.50.123"
+	wantIPs := map[string]bool{
+		"192.168.50.7":   true,
+		"192.168.50.123": true,
+	}
 	isPortOpenFunc = func(ip string, port int, timeout time.Duration) bool {
-		return ip == wantIP
+		return wantIPs[ip]
 	}
 
 	fetchDeviceDescriptionFunc = func(ctx context.Context, _ *http.Client, location string) (string, string, string, error) {
-		if strings.Contains(location, wantIP) {
-			return "Office", "uuid:RINCON_OFFICE1400", wantIP, nil
+		for ip := range wantIPs {
+			if strings.Contains(location, ip) {
+				return "Office", "uuid:RINCON_OFFICE1400", ip, nil
+			}
 		}
 		return "", "", "", errors.New("not a sonos speaker")
 	}
@@ -84,22 +89,22 @@ func TestScanAnySpeakerIPFindsSpeaker(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	t.Cleanup(cancel)
 
-	got, err := scanAnySpeakerIP(ctx, 2*time.Second)
+	got, err := scanSpeakerIPs(ctx, 2*time.Second)
 	if err != nil {
-		t.Fatalf("scanAnySpeakerIP: %v", err)
+		t.Fatalf("scanSpeakerIPs: %v", err)
 	}
-	if got != wantIP {
-		t.Fatalf("expected %q, got %q", wantIP, got)
+	if len(got) != 2 || got[0] != "192.168.50.7" || got[1] != "192.168.50.123" {
+		t.Fatalf("expected both speakers in IP order, got %#v", got)
 	}
 }
 
-func TestScanAnySpeakerIPNoLocalAddrsErrors(t *testing.T) {
+func TestScanSpeakerIPsNoLocalAddrsErrors(t *testing.T) {
 	origLocal := localIPv4AddrsFunc
 	t.Cleanup(func() { localIPv4AddrsFunc = origLocal })
 
 	localIPv4AddrsFunc = func() ([]net.IP, error) { return nil, nil }
 
-	_, err := scanAnySpeakerIP(context.Background(), 500*time.Millisecond)
+	_, err := scanSpeakerIPs(context.Background(), 500*time.Millisecond)
 	if err == nil {
 		t.Fatalf("expected error")
 	}

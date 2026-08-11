@@ -273,7 +273,20 @@ func resolveTargetCoordinatorIP(ctx context.Context, flags *rootFlags) (string, 
 		return "", errors.New("no speakers found")
 	}
 
-	c := newSonosClient(devs[0].IP, flags.Timeout)
+	var target sonos.Device
+	for _, dev := range devs {
+		if strings.EqualFold(strings.TrimSpace(dev.Name), strings.TrimSpace(flags.Name)) {
+			target = dev
+			break
+		}
+	}
+	if target.IP == "" {
+		return "", errors.New("speaker name not found: " + flags.Name)
+	}
+
+	// Use the matched room as the topology foothold. Separate S1 and S2
+	// households cannot see each other through GetZoneGroupState.
+	c := newSonosClient(target.IP, flags.Timeout)
 	top, err := c.GetTopology(ctx)
 	if err != nil {
 		return "", err

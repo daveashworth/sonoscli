@@ -62,7 +62,7 @@ func TestDiscoverViaTopologyFromIP(t *testing.T) {
 	}
 }
 
-func TestDiscoverViaTopology_PrefersLargestCandidate(t *testing.T) {
+func TestDiscoverViaTopology_MergesSeparateHouseholds(t *testing.T) {
 	oldNewClient := newClientForDiscover
 	t.Cleanup(func() { newClientForDiscover = oldNewClient })
 
@@ -70,13 +70,12 @@ func TestDiscoverViaTopology_PrefersLargestCandidate(t *testing.T) {
 		var zgs string
 		switch ip {
 		case "10.0.0.1":
-			zgs = `<ZoneGroupState><ZoneGroups><ZoneGroup Coordinator="RINCON_KITCHEN1400" ID="RINCON_KITCHEN1400:1">` +
-				`<ZoneGroupMember ZoneName="Kitchen" UUID="RINCON_KITCHEN1400" Location="http://10.0.0.1:1400/xml/device_description.xml" Invisible="0" />` +
+			zgs = `<ZoneGroupState><ZoneGroups><ZoneGroup Coordinator="RINCON_S11400" ID="RINCON_S11400:1">` +
+				`<ZoneGroupMember ZoneName="Legacy Office" UUID="RINCON_S11400" Location="http://10.0.0.1:1400/xml/device_description.xml" Invisible="0" />` +
 				`</ZoneGroup></ZoneGroups></ZoneGroupState>`
 		default:
-			zgs = `<ZoneGroupState><ZoneGroups><ZoneGroup Coordinator="RINCON_KITCHEN1400" ID="RINCON_KITCHEN1400:1">` +
-				`<ZoneGroupMember ZoneName="Kitchen" UUID="RINCON_KITCHEN1400" Location="http://10.0.0.1:1400/xml/device_description.xml" Invisible="0" />` +
-				`<ZoneGroupMember ZoneName="Living Room" UUID="RINCON_LIVING1400" Location="http://10.0.0.2:1400/xml/device_description.xml" Invisible="0" />` +
+			zgs = `<ZoneGroupState><ZoneGroups><ZoneGroup Coordinator="RINCON_S21400" ID="RINCON_S21400:1">` +
+				`<ZoneGroupMember ZoneName="Modern Office" UUID="RINCON_S21400" Location="http://10.0.0.2:1400/xml/device_description.xml" Invisible="0" />` +
 				`</ZoneGroup></ZoneGroups></ZoneGroupState>`
 		}
 
@@ -113,7 +112,7 @@ func TestDiscoverViaTopology_PrefersLargestCandidate(t *testing.T) {
 	if len(out) != 2 {
 		t.Fatalf("expected 2 devices, got %d: %#v", len(out), out)
 	}
-	if out[0].Name != "Kitchen" || out[1].Name != "Living Room" {
+	if out[0].Name != "Legacy Office" || out[1].Name != "Modern Office" {
 		t.Fatalf("unexpected devices: %#v", out)
 	}
 }
