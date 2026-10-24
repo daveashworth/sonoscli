@@ -12,5 +12,8 @@
     "lint": "golangci-lint run ./...",
     "ci": "make ci",
     "docs:site": "node scripts/build-docs-site.mjs"
+  },
+  "engines": {
+    "node": ">=24.22.1 <25"
   }
 }
